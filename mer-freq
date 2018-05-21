@@ -1,0 +1,611 @@
+#!/usr/bin/env python
+
+
+import cPickle as pickle
+import collections
+import csv
+import gzip
+import itertools
+import json
+import multiprocessing as mp
+import os
+import re
+import sqlite3
+import sys
+import time
+from argparse import ArgumentParser
+from glob import glob
+from math import sqrt
+from shutil import rmtree
+from tempfile import mkdtemp
+
+import numpy as np
+import pandas as pd
+from Bio import SeqIO
+from Bio.Alphabet import generic_dna
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from regex import findall
+from scipy.stats.mstats import pearsonr
+
+def parseArgs():
+	parser = ArgumentParser(description='Given nucleotide sequences, '
+		'calculates observed and expected k-mer frequencies, '
+		'calculates Z-scores for each k-mer, and reports the '
+		'Pearson correlation', add_help=False,
+		epilog='NOTE: if using * for large input sets and it exceeds your '
+		'shell\'s ability to fully expand, surround the field with single '
+		'or double quotes and Python will handle it')
+	req = parser.add_argument_group('Required')
+	req.add_argument('set', metavar='FILE', nargs='+',
+		help='input sequence file(s), optionally gunzip compressed')
+	opt = parser.add_argument_group('Optional')
+	opt.add_argument('-b', '--best-hits', type=int, metavar='INT',
+		default=0, help='report best number of correlations per input [all]')
+	opt.add_argument('-c', '--min-correlation', type=float, metavar='FLOAT',
+		default=0.989, help='report correlations that meet or exceed value '
+		'[0.989]')
+	opt.add_argument('-f', '--format', choices=['fasta', 'genbank'],
+		default='fasta', help='file format of input [fasta]')
+	opt.add_argument('-h', '--help', action='help',
+		help='show this help message and exit')
+	opt.add_argument('-k', '--kmer-size', type=int, metavar='INT',
+		default=4, help='kmer length to use in calculations [4]')
+	opt.add_argument('-l', '--min-length', type=int, metavar='INT',
+		default=1000, help='minimum sequence length (base pairs) to use '
+		'in kmer frequency calculations [1000]')
+	opt.add_argument('-m', '--markov-method', choices={'MCM', 'ZOM'},
+		default='MCM', help='Markov method for frequency calculations [MCM]')
+	opt.add_argument('-o', '--outfile', required=False, metavar='FILE',
+		default=None, help='tab-delimited output of pairwise correlations '
+		'[stdout]')
+	opt.add_argument('-p', '--processes', type=int, metavar='INT',
+		default=0, help='number of parallel processes to use [all]')
+	opt.add_argument('--asm-acc', metavar='STR', nargs='*',
+		type=str, help='assembly accession(s) for input '
+		'file(s); must be same quantity as input file(s); when >1 given they '
+		'are paired to the input files in the order provided; used to store '
+		'as the unique identifier(s) in output database; only required if '
+		'unable to detect from genbank file(s); to use input file set names '
+		'use --asm-acc filenames')
+	opt.add_argument('--biosample', metavar='STR', nargs='*',
+		type=str, help='biosample identifier(s) for input '
+		'file(s); must be same quantity as input file(s); when >1 given they '
+		'are paired to the input files in the order provided; used to store '
+		'as biosample identifier in output database; only used if '
+		'unable to detect from genbank file(s) and --out-db or --out-pkl is '
+		'specified')
+	opt.add_argument('--organism', metavar='\'STR\'', nargs='*',
+		type=str, help='organism name(s) for input '
+		'file(s); must be same quantity as input file(s); when >1 given they '
+		'are paired to the input files in the order provided; used to store '
+		'as organism name in output database; only used if '
+		'unable to detect from genbank file(s) and --out-db or --out-pkl is '
+		'specified; surround organism name with apostrophes or quotes to '
+		'enable spaces')
+	opt.add_argument('--in-db', metavar='FILE', default=None,
+		help='SQLite database file to query; requires the format which is '
+		'used in --out-db from this script')
+	opt.add_argument('--in-json', metavar='FILE', default=None,
+		action='append', help='JSON file to query; requires the format '
+		'which is used in --out-json from this script')
+	opt.add_argument('--in-pkl', metavar='FILE', default=None,
+		action='append', help='Pickle file to query; requires the format '
+		'which is used in --out-pkl from this script')
+	opt.add_argument('--out-db', metavar='FILE', default=None,
+		help='output SQLite database file')
+	opt.add_argument('--out-db-repeats', default='quit',
+		choices=['skip', 'overwrite', 'quit'],
+		help='how identical assembly accessions are handled; especially '
+		'helpful when out-db provided is non-empty [quit]')
+	opt.add_argument('--out-json', metavar='FILE', default=None,
+		help='output JSON file')
+	opt.add_argument('--out-pkl', metavar='FILE', default=None,
+		help='output pickle file')
+	opt.add_argument('--query-organism', type=str, metavar='\'STR\'',
+		default=None, help='correlate input sequences only with a matching '
+		'organism name field within the input database [all]')
+	opt.add_argument('--r-inter-db-sets', action='store_true',
+		default=False, help='compute all correlations between the input sets '
+		'and the entries in input database and input pickle file(s) [off]')
+	opt.add_argument('--r-intra-db', action='store_true',
+		default=False, help='compute all correlations within the entries in '
+		'input database and input pickle file(s) [off]')
+	opt.add_argument('--r-intra-sets', action='store_false',
+		default=True, help='skip computing all correlations within the input '
+		'sets [off]')
+	opt.add_argument('--r-skip', action='store_true', default=False,
+		help='skip all Pearson correlation calculations when >1 file '
+		'provided; only calculate frequencies and Z-scores; useful for '
+		'creating an output reference database or pickle file [off]')
+	opt.add_argument('--split-seq-recs', action='store_true',
+		default=False, help='compute nucleotide frequencies on a '
+		'per-sequence record basis rather than a per-file basis; ' 
+		'_Split<int> is appended to each accession in output [off]')
+	return parser.parse_args()
+
+def split_multiseq_file(infile, fmt, tmp):
+	# returns a list of full paths to split FastA or GenBank files
+	split_files = []
+	i = 1
+	for rec in SeqIO.parse(infile, fmt):
+		defln = '{}_Split{}'.format(os.path.basename(infile), i)
+		single_seqrec = SeqRecord(Seq(str(rec.seq), generic_dna), id=defln)
+		SeqIO.write(single_seqrec, os.path.join(tmp, defln), fmt)
+		split_files.append(os.path.join(tmp, defln))
+		i += 1
+	return split_files
+
+def gen_kmers(k):
+	# generates sorted list of all kmers when a k integer is specified
+	for kmer in itertools.product(('A', 'C', 'G', 'T'), repeat=k):
+		yield ''.join(kmer)  # faster than appending to string
+
+def calc_zscores_mcm(c, k):
+	# for each kmer, calc expected frequencies with a 
+	# maximal order Markov chain model (k, k-1, k-2)
+	mer_z = []
+	for mer in gen_kmers(k): # even if ambig nucs in Counters, we skip them
+		mid = c[k-2][mer[1:k-1]]
+		try:
+			exp = 1. * c[k-1][mer[:k-1]] * c[k-1][mer[1:]] / mid
+			std = sqrt(exp * (mid-c[k-1][mer[:k-1]]) * (mid-c[k-1][mer[1:]])
+				/ (mid**2))
+			mer_z.append((c[k][mer]-exp) / std)
+		except ZeroDivisionError:
+			# NOTE: implement Katz's 1987 back-off model
+			if mid > 0: # if a (k-1)mer is absent
+				mer_z.append(c[k][mer] / (mid**2))
+			elif mid == 0: # if a (k-2)"mid"mer is absent
+				mer_z.append(c[k][mer]-exp)
+	return mer_z
+
+def cnt_kmers_mcm(seq_file, minlen, fmt, k):
+	if seq_file.endswith('.gz'):
+		seq_file = gzip.open(seq_file)
+	# math more readible if c Counters are 1-based; idx vals based on k-value
+	c = [collections.Counter() for _ in range(k + 1)]
+	seq_len = 0
+	for rec in SeqIO.parse(seq_file, fmt):
+		if len(rec.seq) < minlen:
+			sys.stderr.write('INFO: skipping {} due to small size...\n'.\
+				format(rec.id))
+			continue
+		for seq in [str(rec.seq).upper(),
+					str(rec.seq.reverse_complement()).upper()]:
+			# NOTE: count func doesnt tally overlaps so cant use for kmers
+			# Prefer regex.findall overlapping func for speed (written in C);
+			# this method is quicker for shortmers (1-3mers)
+			seq_len += len(rec.seq)
+			if k <= 4:
+				for ksize, cntr in [(k-1, c[k-1]), (k-2, c[k-2])]:
+					for kmer in gen_kmers(ksize):
+						cntr[kmer] += len(findall(kmer, seq, overlapped=True))
+			elif k == 5:
+				for ksize, cntr in [(k-2, c[k-2])]:
+					for kmer in gen_kmers(ksize):
+						cntr[kmer] += len(findall(kmer, seq, overlapped=True))
+			# slice across seq instead of iterating over each bigmer (>3mers)
+			if k > 3:
+				if k == 4:
+					ksizes = [4]
+					cntrs = [c[4]]
+				elif k == 5:
+					ksizes = [k, k-1]
+					cntrs = [c[k], c[k-1]]
+				elif k > 5:
+					ksizes = [k, k-1, k-2]
+					cntrs = [c[k], c[k-1], c[k-2]]
+				for ksize, cntr in zip(ksizes, cntrs):
+					for i in range(len(seq) - ksize + 1):
+						cntr[seq[i:i + ksize]] += 1
+	if seq_len == 0:
+		sys.stderr.write('ERROR: no nucleotide sequence records >= {} bp '
+			'detected in {}\n'.format(minlen, seq_file))
+		sys.exit(1)
+	return (calc_zscores_mcm(c, k), seq_len / 2)
+
+def calc_usg_departs_zom(c, k, seq_len):
+	mono_freqs = {} # 1mer freqs for full seq rec(s)
+	for n in ('A', 'C', 'G', 'T'):
+		# revcomp also tallied for simpler loop earlier so *0.5; forces float
+		mono_freqs[n] = 0.5 * c[0][n] / seq_len
+	mers_cnt = seq_len - k + 1
+	usg_departs = []
+	for mer in gen_kmers(k): # even if ambig nucs in Counters, we skip them
+		mono_cnt_mer = {} # 1mer freqs for each indiv mer 
+		for n in ('A', 'C', 'G', 'T'):
+			mono_cnt_mer[n] = mer.count(n)
+		# if any(mono_freqs[mono] == 0 for mono in ('A','T','C', 'G')):
+		# 	# TO-DO: if expected word is zero, it might be useful to report
+		# 	#        the kmer itself because it might be particularly
+		# 	#        over-represented then(?)
+		# 	sys.stderr.write('ERROR: suspicious {} sequence lacks at least '
+		# 		'one nucleotide entirely\n'.format(infile))
+		# 	sys.exit(1)
+		# for each kmer, calc expected frequencies with a 
+		# zero order Markov chain model (kmer and 1mer frequencies)
+		expected_mer_freq = ((mono_freqs['A'] ** mono_cnt_mer['A']) *
+							 (mono_freqs['C'] ** mono_cnt_mer['C']) *
+							 (mono_freqs['G'] ** mono_cnt_mer['G']) *
+							 (mono_freqs['T'] ** mono_cnt_mer['T']) *
+							mers_cnt)
+		usg_departs.append(1. * c[1].get(mer, 0) / expected_mer_freq)
+	return (usg_departs, seq_len / 2)
+
+def cnt_kmers_zom(seq_file, minlen, fmt, k):
+	if seq_file.endswith('.gz'):
+		seq_file = gzip.open(seq_file)
+	# c list of Counters idx0 always mono 1mers; idx1 k-size tallies
+	c = [collections.Counter(), collections.Counter()]
+	seq_len = 0
+	for rec in SeqIO.parse(seq_file, fmt):
+		if len(rec.seq) < minlen:
+			sys.stderr.write('INFO: skipping {} due to small size...\n'.\
+				format(rec.id))
+			continue
+		for seq in [str(rec.seq).upper(),
+					str(rec.seq.reverse_complement()).upper()]:
+			for n in ('A', 'C', 'G', 'T'):
+				c[0][n] += seq.count(n)
+			for i in range(len(seq) - k + 1):
+				c[1][seq[i:i + k]] += 1
+			seq_len += len(seq)
+	return calc_usg_departs_zom(c, k, seq_len)
+
+def get_sorted_freqs(args):
+	seq_file, acc, bio, org, fmt, minlen, kmers, k, markov_method, data = args
+	if markov_method == 'MCM':
+		sorted_zscores, seq_len = cnt_kmers_mcm(seq_file, minlen, fmt, k)
+	elif markov_method == 'ZOM':
+		sorted_zscores, seq_len = cnt_kmers_zom(seq_file, minlen, fmt, k)
+	data[acc] = (sorted_zscores, seq_len, bio, org)
+
+def sql_open(sql_out):
+	try:
+		con = sqlite3.connect(sql_out)
+		cur = con.cursor()
+		return con, cur
+	except sqlite3.Error as e:
+		sys.stderr.write('ERROR: {}\n'.format(e))
+		sys.exit(1)
+
+def sql_close(con, cur):
+	cur.close()
+	con.close()
+
+def sql_create_table(cur, tbl):
+	cur.execute('''
+		CREATE TABLE IF NOT EXISTS {} (
+		assembly_accession TEXT UNIQUE NOT NULL,
+		zscores TEXT NOT NULL,
+		seq_len INTEGER,
+		biosample TEXT,
+		organism TEXT
+		)'''.format(tbl))
+
+def sql_data_entry(con, cur, tbl, dat, dupe):
+	try:
+		cur.executemany('INSERT INTO {} VALUES({})'.format(
+			tbl, ('?,' * 5)[:-1]), dat)
+		con.commit()
+	# STILL errors if I give out-db <FILE> with key in it from previous run
+	except sqlite3.IntegrityError as e:
+		if str(e).startswith('UNIQUE constraint failed') and dupe == 'skip':
+			sys.stderr.write('INFO: assembly accession key already exists '
+				'in sqlite database; skipping\n')
+			pass 
+		elif str(e).startswith('UNIQUE constraint failed') and \
+		dupe == 'overwrite':
+			sys.stderr.write('INFO: assembly accession key already exists '
+				'in sqlite database; overwriting\n')
+			pass
+		raise
+
+def get_list_from_multiarg(items, arg_name, filesets, fileset_size,
+	strip_apostrophes_quotes=False):
+	# splits up a <str> or None, verifies expected length, and returns <list>
+	if items is None:
+		return [None] * fileset_size
+	elif items[0] == 'filenames' or 'filename':
+		l = [os.path.basename(os.path.splitext(s)[0]) for s in filesets]
+	else:
+		if strip_apostrophes_quotes:
+			l = [s.strip('\'').strip('"') for s in items]
+		else:
+			l = items
+		if len(l) != fileset_size:
+			sys.stderr.write('ERROR: different number of sequence sets ({}) '
+				'and {}s provided ({}); cannot pair them properly\n'.format(
+				fileset_size, arg_name, len(l)))
+			sys.exit(1)
+	if arg_name == 'asm accn' and len(l) != len(set(l)):
+		sys.stderr.write('ERROR: found repeat assembly accessions. Each must '
+			'be a unique identifier.\n')
+		sys.exit(1)
+	return l
+
+def get_metadata(filename, rec, fmt, asm_acc, biosample, organism):
+	# returns <list> containing [accession, biosample, organism]
+	#  where biosample and organism can be None but accession cannot
+	a, b, c = None, None, None
+	if fmt == 'genbank':
+		x = dict(s.split(':') for s in rec.dbxrefs)
+		a = x.get('Assembly', None)
+		b = x.get('BioSample', None)
+		c = rec.annotations['organism']
+	if asm_acc is not None:
+		a = asm_acc
+	if biosample is not None:
+		b = biosample
+	if organism is not None:
+		c = organism
+	if a is None:
+		f = os.path.basename(filename)
+		regex = re.compile(r'GC[AF]_[0-9]{9}.[0-9]_')
+		if re.match(regex, f) is not None:
+			a = '_'.join(f.split('_')[:2])
+		elif fmt == 'genbank':
+			try:
+				a = rec.annotations['accessions'][-1]
+			except KeyError, e:
+			#Occurs (empty) with SAMN.bgpipe.output.gb from NCBI after deposit
+				raise Exception('KeyError: {}\n\nERROR: assembly accession '
+					'not provided, undetectable from input file content, '
+					'and undetectable from filename. Unique accession '
+					'required to save {} to database.'.format(e, filename))
+		else:
+			sys.stderr.write('ERROR: assembly accession not provided and '
+				'undetectable from filename. Unique accession required to '
+				'save {} to database.'.format(filename))
+			os._exit(1)
+	return a, b, c
+
+def add_to_sample_list(args):
+	# adds <list> to shared list object containing
+	#  [seqfilename, asm_accn, biosample, organism, seqfileformat, minseqlen]
+	infile, a, b, o, split, m, n, tmp, samples = args
+	if infile.endswith('.gz'):
+		with gzip.open(infile) as ifh:
+			try:
+				rec = SeqIO.parse(ifh, m).next()
+			except StopIteration:
+				raise Exception('StopIteration\n\nERROR: unable to parse the '
+					'first sequence record of {} as a {} format file. '
+					'Perhaps the incorrect format (--format) was specified, '
+					'or content is non-conformat to BioPython\'s '
+					'expectations.'.format(infile, m))
+	else:
+		try:
+			rec = SeqIO.parse(infile, m).next()
+		except StopIteration:
+			raise Exception('StopIteration\n\nERROR: unable to parse the '
+				'first sequence record of {} as a {} format file. '
+				'Perhaps the incorrect format (--format) was specified, '
+				'or content is non-conformat to BioPython\'s '
+				'expectations.'.format(infile, m))
+	acc, bio, org = get_metadata(infile, rec, m, a, b, o)
+	if split:
+		split_files = split_multiseq_file(infile, m, tmp)
+		for i, f in enumerate(split_files):
+			i += 1
+			samples.append([f, '{}_Split{}'.format(acc, i), bio, org, m, n])
+	else:
+		samples.append([infile, acc, bio, org, m, n])
+
+def chunk_data(dat, rows_per_chunk=200000):
+	chunk = []
+	for i, row in enumerate(dat):
+		if i % rows_per_chunk == 0 and i > 0:
+			yield chunk
+			del chunk[:]
+		chunk.append([str(s).decode('UTF-8') for s in row])
+	yield chunk
+
+def merge_dics(*dics):
+	merged = {}
+	for dic in dics:
+		merged.update(dic)
+	return merged
+
+def gen_pairs(qry, ref, combo_types=[]):
+	pairs_generated = []
+	if 'r_intra_sets' in combo_types:
+		pairs_generated.extend(list(itertools.combinations(qry, 2)))
+	if 'r_intra_db' in combo_types:
+		pairs_generated.extend(list(itertools.combinations(ref, 2)))
+	if 'r_inter_db_sets' in combo_types:
+		pairs_generated.extend(list(itertools.product(qry, ref)))
+	return pairs_generated
+
+def calc_correlation(args):
+	pairs, r_min, d, corr = args[:2], args[2], args[3], args[4]
+	freqs = (d[pairs[0]][0], d[pairs[1]][0])
+	r_val, p_val = pearsonr(freqs[0], freqs[1])
+	if r_val >= r_min:
+		corr.append('{}\t{}\t{}\t{}\t{}\t{}\t{}'.format(
+				r_val, pairs[0], pairs[1],
+				d[pairs[0]][2], d[pairs[1]][2],
+				d[pairs[0]][3], d[pairs[1]][3]))
+
+def main():
+	#### I/O handling
+	opt = parseArgs()
+	sets = []
+	for file in opt.set:
+		if '*' in file:
+			f = file.strip('\'').strip('"')
+			sets.extend(glob(os.path.abspath(os.path.expanduser(f))))
+		else:
+			sets.append(os.path.abspath(os.path.expanduser(file)))
+	cnt_sets = len(sets)
+	sys.stderr.write('INFO: {} input file sets\n'.format(cnt_sets))
+	accs = get_list_from_multiarg(opt.asm_acc, 'asm accn', sets, cnt_sets)
+	bios = get_list_from_multiarg(opt.biosample, 'biosample', None, cnt_sets)
+	orgs = get_list_from_multiarg(opt.organism, 'organism', None, cnt_sets,
+		strip_apostrophes_quotes=True)
+	k = opt.kmer_size
+	m = opt.format
+	n = opt.min_length
+	if cnt_sets == 1 and all(item is None for item in [opt.out_db,
+	opt.out_json, opt.out_pkl, opt.in_db, opt.in_json, opt.in_pkl]):
+		sys.stderr.write('>1 sequence file required to perform correlation, '
+			'and >0 output files required to save {}mer Z-scores, so no '
+			'computing to do; exiting...\n'.format(k))
+		sys.exit(0)
+	if opt.processes > 0:
+		cpus = opt.processes
+	else:
+		cpus = mp.cpu_count()
+
+	#### STEP1of4 Process input sequence file metadata and optionally split 
+	####          mfasta files that will be used for mer-freq calculations
+	samples = mp.Manager().list()
+	# list of input [seqfile, asm_acc, biosample, organism, seqfmt, minseqlen]
+	tmp = mkdtemp()
+	start = time.time()
+	pool = mp.Pool(processes=cpus)
+	args = zip(sets, accs, bios, orgs, [opt.split_seq_recs]*len(sets),
+		[m]*len(sets), [n]*len(sets), [tmp]*len(sets), [samples]*len(sets))
+	pool.map_async(add_to_sample_list, args).get(timeout=99999)
+	sys.stderr.write('INFO: add_to_sample_list took {} s\n'.format(
+		time.time() - start))
+
+	#### STEP2of4 Calculate sorted Z-scores for each input sequence file ####
+	data = mp.Manager().dict()
+	#     data key = unique assembly accession string
+	#     data val = (sorted zscores list, seq len, biosampleID, organismID)
+	start = time.time()
+	pool = mp.Pool(processes=cpus)
+	kmers = sorted(list(gen_kmers(k)))
+	args = [s + [kmers, k, opt.markov_method, data] for s in samples]
+	pool.map_async(get_sorted_freqs, args).get(timeout=99999)
+	sys.stderr.write('INFO: calc_zscores took {} s\n'.format(
+		time.time() - start))
+	rmtree(tmp)
+	query_samples = data.keys()
+
+	#### Add JSON, pickle, and sqlite3 input data to the data dict object ####
+	ref_samples = [] # keep track of input reference data
+	if opt.in_json is not None:
+		start = time.time()
+		for json_file in opt.in_json:
+			with open(os.path.abspath(os.path.expanduser(json_file)), 'r') \
+			as jfh:
+				json_dic = json.load(jfh)
+			if opt.query_organism is not None:
+				# v[3] is organismID in data dict vals
+				qry_org = opt.query_organism.strip('\'').strip('"').upper()
+				json_dic = {k: v for k, v in json_dic.iteritems() \
+					if qry_org in v[3].upper()}
+			data = merge_dics(json_dic, data) # precedence to seq file input
+			ref_samples.extend(json_dic.keys())
+		sys.stderr.write('INFO: json load took {} s\n'.format(
+			time.time() - start))
+	if opt.in_pkl is not None:
+		start = time.time()
+		for pkl_file in opt.in_pkl:
+			with open(os.path.abspath(os.path.expanduser(pkl_file)), 'rb') \
+			as pfh:
+				pkl_dic = pickle.load(pfh)
+			if opt.query_organism is not None:
+				# v[3] is organismID in data dict vals
+				qry_org = opt.query_organism.strip('\'').strip('"').upper()
+				pkl_dic = {k: v for k, v in pkl_dic.iteritems() \
+					if qry_org in v[3].upper()}
+			data = merge_dics(pkl_dic, data) # precedence to seq file input
+			ref_samples.extend(pkl_dic.keys())
+		sys.stderr.write('INFO: pickle load took {} s\n'.format(
+			time.time() - start))
+	if opt.in_db is not None:
+		con, cur = sql_open(os.path.abspath(os.path.expanduser(opt.in_db)))
+		tbl = 'zscores_{}mer_{}'.format(k, opt.markov_method)
+		if opt.query_organism is None:
+			cur.execute('''SELECT assembly_accession, zscores, seq_len, 
+				biosample, organism FROM {}
+				'''.format(tbl))
+		else:
+			cur.execute('''SELECT assembly_accession, zscores, seq_len, 
+				biosample, organism FROM {} WHERE organism LIKE \'%{}%\'
+				'''.format(tbl, opt.query_organism.strip('\'')))
+		if not cur.rowcount:
+			sys.stderr.write('ERROR: no {} entries found in {}\n'.format(
+				tbl, opt.in_db))
+			sys.exit(1)
+		sql_data = cur.fetchall()
+		sql_close(con, cur)
+		sql_dic = {d[0]: d[1:5] for d in sql_data}
+		data = merge_dics(sql_dic, data) # precedence to seq file input
+		ref_samples.extend(sql_dic.keys())
+	if opt.in_pkl or opt.in_db is not None:
+		ref_samples = list(set(ref_samples))
+
+	#### Output any databases specified before correlations are computed ####
+	if opt.out_json is not None:
+		with open(os.path.abspath(os.path.expanduser(opt.out_json)), 'w') \
+		as o:
+			json.dump(data, o)
+	if opt.out_pkl is not None:
+		with open(os.path.abspath(os.path.expanduser(opt.out_pkl)), 'wb') \
+		as o:
+			pickle.dump(dict(data), o, protocol=pickle.HIGHEST_PROTOCOL)
+	if opt.out_db is not None:
+		con, cur = sql_open(os.path.abspath(os.path.expanduser(opt.out_db)))
+		tbl = 'zscores_{}mer_{}'.format(k, opt.markov_method)
+		sql_create_table(cur, tbl)
+		l = [(k, v[0], v[1], v[2], v[3]) for k, v in data.items()]
+		for chunk in chunk_data(l):
+			sql_data_entry(con, cur, tbl, chunk, opt.out_db_repeats)
+		sql_close(con, cur)
+
+	#### Finish if correlations unwanted ####
+	if opt.r_skip:
+		sys.stderr.write('INFO: skipped correlation calculation(s)\n')
+		sys.exit(0)
+
+	#### STEP3of4 Calculate correlations ####
+	combos = []
+	if opt.r_inter_db_sets:
+		combos.append('r_inter_db_sets')
+	if opt.r_intra_db:
+		combos.append('r_intra_db')
+	if opt.r_intra_sets:
+		combos.append('r_intra_sets')
+	pairs = gen_pairs(query_samples, ref_samples, combo_types=combos)
+	start = time.time()
+	pool = mp.Pool(processes=cpus)
+	corr = mp.Manager().list()
+	args = [(x[0], x[1], opt.min_correlation, data, corr) for x in pairs]
+	pool.map_async(calc_correlation, args).get(timeout=99999)
+	sys.stderr.write('INFO: calc_correlation took {} s\n'.format(
+		time.time() - start))
+
+	#### STEP4of4 Post-process correlations ####
+	hdr = ('Correlation\t{a}query\t{a}ref\t{b}query\t{b}ref\t{o}query'
+	'\t{o}ref'.format(a='Accession_', b='Biosample_', o='Organism_'))
+	if opt.best_hits > 0:
+		df = pd.DataFrame.from_records([s.split('\t') for s in corr],
+			columns=hdr.split('\t'))
+		df_filt = []
+		for acc in zip(*samples)[1]:
+			df_acc = df[df['Accession_query']==acc]
+			df_num = df_acc.sort_values(by='Correlation',
+				ascending=False).head(opt.best_hits)
+			df_filt.append(df_num)
+		df_out = pd.concat(df_filt)
+		if opt.outfile is not None:
+			ofh = open(os.path.abspath(os.path.expanduser(opt.outfile)), 'w')
+		else:
+			ofh = sys.stdout
+		df_out.to_csv(ofh, sep='\t', index=False, quoting=csv.QUOTE_NONE)
+	else:
+		if opt.outfile is not None:
+			ofh = open(os.path.abspath(os.path.expanduser(opt.outfile)), 'w')
+		else:
+			ofh = sys.stdout
+		ofh.write('{}\n'.format(hdr))
+		for ln in corr:
+			ofh.write('{}\n'.format(''.join(ln)))
+
+if __name__ == '__main__':
+	main()
