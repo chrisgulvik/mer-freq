@@ -1,5 +1,13 @@
 # mer-freq
 
+#### Dependencies
+- [Python 2.7.+](https://www.python.org)
+- [Biopython 1.68+](https://biopython.org/)
+- [NumPy](http://www.numpy.org/)
+- [Pandas](https://pandas.pydata.org/)
+- [regex](https://pypi.org/project/regex/)
+- [SciPy](https://www.scipy.org/)
+
 ###### Database
 - Merge split compressed files into single text file:
 `cd db && cat 4mer_MCM.Bacteria.RefSeq.json.gz.0* | gunzip -c > 4mer_MCM.Bacteria.RefSeq.json`
